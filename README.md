@@ -68,11 +68,11 @@ Use **Backup & Restore → Download backup JSON** to save the selected account's
 
 ## Deploy for free on Vercel
 1. Create a Vercel Hobby project from this GitHub repository. The root `Dockerfile` selects Vercel's Container runtime.
-2. Create a free TiDB Cloud Starter cluster, then connect it to the Vercel project with the TiDB Cloud Marketplace integration.
-3. Confirm the integration provides `TIDB_HOST`, `TIDB_PORT`, `TIDB_USER`, `TIDB_PASSWORD` and `TIDB_DATABASE`.
+2. Create a free Neon PostgreSQL database and keep its connection details private.
+3. In Vercel, set `LIFEORG_DB_URL` to `jdbc:postgresql://<host>:5432/<database>?sslmode=require`, `LIFEORG_DB_USER` and `LIFEORG_DB_PASSWORD` from Neon. The Docker image selects the `neon` Spring profile and PostgreSQL JDBC driver.
 4. Set `PORT=80`, `SERVER_ADDRESS=0.0.0.0` and `SESSION_COOKIE_SECURE=true` for the Vercel deployment.
 
-The app applies `database/upgrade_all.sql` at startup and stores sign-in sessions in the shared TiDB database so they survive container scale-down. Use a new hosted database; local records are not uploaded. Vercel Hobby and TiDB Starter are free within their current usage quotas, and deployments may pause when a quota is reached. Public signup currently has no email verification or password recovery.
+The app applies `database/upgrade_postgres.sql` at startup and stores sign-in sessions in the hosted database so they survive container scale-down. Use a new hosted database; local records are not uploaded. Vercel Hobby and Neon Free are subject to their current usage quotas, and deployments or database compute may pause when a quota is reached. Public signup currently has no email verification or password recovery.
 
 ## Notes
 - Keep a copy of your previous project folder before replacing source files.

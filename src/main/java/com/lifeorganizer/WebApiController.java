@@ -2,6 +2,7 @@ package com.lifeorganizer;
 
 import java.math.BigDecimal;
 import java.sql.Date;
+import java.sql.PreparedStatement;
 import java.sql.Time;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -15,9 +16,12 @@ import java.util.Map;
 import java.util.Objects;
 
 import org.springframework.dao.DataAccessException;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.support.GeneratedKeyHolder;
+import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.transaction.annotation.Transactional;
@@ -71,9 +75,14 @@ public class WebApiController {
     private static final Map<String, List<String>> BACKUP_COLUMNS = backupColumns();
 
     private final JdbcTemplate jdbc;
+    private final String searchCastType;
+    private final boolean postgresqlDatabase;
 
-    public WebApiController(JdbcTemplate jdbc) {
+    public WebApiController(JdbcTemplate jdbc,
+                            @Value("${lifeorganizer.database-dialect:mysql}") String databaseDialect) {
         this.jdbc = jdbc;
+        this.postgresqlDatabase = databaseDialect.equalsIgnoreCase("postgresql");
+        this.searchCastType = postgresqlDatabase ? "VARCHAR" : "CHAR";
     }
 
     private static Map<String, Module> moduleDefinitions() {
@@ -253,8 +262,8 @@ public class WebApiController {
              (SELECT COALESCE(SUM(amount),0) FROM expenses WHERE user_id=?) totalExpenses,
              (SELECT COUNT(*) FROM tasks WHERE user_id=? AND status<>'Completed') activeTasks,
              (SELECT COUNT(*) FROM tasks WHERE user_id=? AND priority<=2 AND status<>'Completed') highPriorityTasks,
-             (SELECT COUNT(*) FROM tasks WHERE user_id=? AND status<>'Completed' AND deadline<CURDATE()) overdueTasks,
-             (SELECT COUNT(*) FROM calendar_events WHERE user_id=? AND event_date>=CURDATE()) upcomingEvents
+             (SELECT COUNT(*) FROM tasks WHERE user_id=? AND status<>'Completed' AND deadline<CURRENT_DATE) overdueTasks,
+             (SELECT COUNT(*) FROM calendar_events WHERE user_id=? AND event_date>=CURRENT_DATE) upcomingEvents
             """;
         return jdbc.queryForMap(sql, id, id, id, id, id, id, id, id);
     }
@@ -296,11 +305,21 @@ public class WebApiController {
             List<Object> args = new ArrayList<>(List.of(owner));
             definition.fields().forEach(f -> args.add(values.get(f.name())));
             String marks = String.join(",", java.util.Collections.nCopies(columns.size(), "?"));
-            jdbc.update("INSERT INTO " + definition.table() + "(" + String.join(",", columns) + ") VALUES(" + marks + ")",
-                args.toArray());
-            Integer id = jdbc.queryForObject("SELECT LAST_INSERT_ID()", Integer.class);
-            audit(owner, definition.table(), id, "CREATE", "Created " + definition.title() + " record");
-            return Map.of("id", Objects.requireNonNull(id), "message", "Record saved.");
+            String sql = "INSERT INTO " + definition.table() + "(" + String.join(",", columns) + ") VALUES(" + marks + ")";
+            KeyHolder keyHolder = new GeneratedKeyHolder();
+            jdbc.update(connection -> {
+                PreparedStatement statement = connection.prepareStatement(sql, new String[] { definition.idColumn() });
+                for (int i = 0; i < args.size(); i++) {
+                    statement.setObject(i + 1, args.get(i));
+                }
+                return statement;
+            }, keyHolder);
+            Number id = keyHolder.getKey();
+            if (id == null) {
+                throw new IllegalStateException("The database did not return the new record ID.");
+            }
+            audit(owner, definition.table(), id.longValue(), "CREATE", "Created " + definition.title() + " record");
+            return Map.of("id", id.longValue(), "message", "Record saved.");
         }
         long id = parseId(recordId);
         String set = definition.fields().stream().map(f -> f.name() + "=?").reduce((a, b) -> a + "," + b).orElseThrow();
@@ -352,7 +371,7 @@ public class WebApiController {
         String like = "%" + q.trim() + "%";
         for (Module definition : MODULES.values()) {
             String predicate = definition.fields().stream()
-                .map(f -> "CAST(" + f.name() + " AS CHAR) LIKE ?")
+                .map(f -> "CAST(" + f.name() + " AS " + searchCastType + ") LIKE ?")
                 .reduce((a, b) -> a + " OR " + b).orElseThrow();
             List<Object> args = new ArrayList<>();
             args.add(owner);
@@ -393,23 +412,30 @@ public class WebApiController {
         List<Map<String, Object>> budgets = jdbc.queryForList(
             "SELECT b.category,b.budget_amount AS budget,COALESCE((SELECT SUM(e.amount) FROM expenses e "
             + "WHERE e.user_id=b.user_id AND e.category=b.category AND e.expense_date>=b.month_start "
-            + "AND e.expense_date<DATE_ADD(b.month_start,INTERVAL 1 MONTH)),0) AS spent "
+            + "AND e.expense_date<?),0) AS spent "
             + "FROM expense_budgets b WHERE b.user_id=? AND b.month_start=? ORDER BY b.category",
-            owner, Date.valueOf(month.atDay(1)));
+            Date.valueOf(month.plusMonths(1).atDay(1)), owner, Date.valueOf(month.atDay(1)));
         return Map.of("month", month.toString(), "categories", categories, "months", months, "budgets", budgets);
     }
 
     @PostMapping("/budgets")
+    @Transactional
     public Map<String, Object> saveBudget(@RequestBody Map<String, Object> body) {
         String category = Objects.toString(body.get("category"), "").trim();
         if (category.isBlank()) throw new IllegalArgumentException("Category is required.");
         YearMonth month = YearMonth.parse(Objects.toString(body.get("month"), YearMonth.now().toString()));
         BigDecimal amount = new BigDecimal(Objects.toString(body.get("amount"), ""));
         if (amount.signum() < 0) throw new IllegalArgumentException("Budget must be zero or greater.");
-        jdbc.update("INSERT INTO expense_budgets(user_id,category,month_start,budget_amount) VALUES(?,?,?,?) "
-            + "ON DUPLICATE KEY UPDATE budget_amount=VALUES(budget_amount)",
-            userId(), category, Date.valueOf(month.atDay(1)), amount);
+        storeBudget(userId(), category, Date.valueOf(month.atDay(1)), amount);
         return Map.of("message", "Budget saved.");
+    }
+
+    private void storeBudget(int owner, String category, Date monthStart, BigDecimal amount) {
+        String sql = "INSERT INTO expense_budgets(user_id,category,month_start,budget_amount) VALUES(?,?,?,?) "
+            + (postgresqlDatabase
+                ? "ON CONFLICT (user_id,category,month_start) DO UPDATE SET budget_amount=EXCLUDED.budget_amount"
+                : "ON DUPLICATE KEY UPDATE budget_amount=VALUES(budget_amount)");
+        jdbc.update(sql, owner, category, monthStart, amount);
     }
 
     @GetMapping("/reports")
@@ -432,13 +458,13 @@ public class WebApiController {
         addReminders(upcoming, jdbc.queryForList("SELECT medicine_id,medicine_name,reminder_time FROM medicines "
             + "WHERE user_id=? ORDER BY reminder_time", owner), "medicine", "medicine_id", "medicine_name", "reminder_time");
         addReminders(upcoming, jdbc.queryForList("SELECT event_id,event_title,event_date,event_time FROM calendar_events "
-            + "WHERE user_id=? AND event_date>=CURDATE() ORDER BY event_date,event_time LIMIT 100",
+            + "WHERE user_id=? AND event_date>=CURRENT_DATE ORDER BY event_date,event_time LIMIT 100",
             owner), "event", "event_id", "event_title", "event_date");
         addReminders(upcoming, jdbc.queryForList("SELECT task_id,task_name,deadline FROM tasks "
-            + "WHERE user_id=? AND status<>'Completed' AND deadline>=CURDATE() ORDER BY deadline LIMIT 100",
+            + "WHERE user_id=? AND status<>'Completed' AND deadline>=CURRENT_DATE ORDER BY deadline LIMIT 100",
             owner), "task", "task_id", "task_name", "deadline");
         addReminders(upcoming, jdbc.queryForList("SELECT bill_id,bill_name,due_date FROM bills "
-            + "WHERE user_id=? AND payment_status='Unpaid' AND due_date>=CURDATE() ORDER BY due_date LIMIT 100",
+            + "WHERE user_id=? AND payment_status='Unpaid' AND due_date>=CURRENT_DATE ORDER BY due_date LIMIT 100",
             owner), "bill", "bill_id", "bill_name", "due_date");
         List<Map<String, Object>> history = jdbc.queryForList("SELECT reminder_key,action_type,snooze_until,updated_at "
             + "FROM reminder_actions WHERE user_id=? ORDER BY updated_at DESC LIMIT 50", owner);
@@ -466,15 +492,15 @@ public class WebApiController {
         LocalDateTime now = LocalDateTime.now().withSecond(0).withNano(0);
         List<Map<String, Object>> due = new ArrayList<>();
         List<Map<String, Object>> medicines = jdbc.queryForList(
-            "SELECT medicine_id,medicine_name,dosage FROM medicines WHERE user_id=? "
-            + "AND TIME_FORMAT(reminder_time,'%H:%i')=?", owner, now.toLocalTime().toString());
+            "SELECT medicine_id,medicine_name,dosage FROM medicines WHERE user_id=? AND reminder_time=?",
+            owner, Time.valueOf(now.toLocalTime()));
         for (Map<String, Object> row : medicines) {
             due.add(due("medicines", "medicine:" + row.get("medicine_id") + ":" + now.toLocalDate(),
                 "Medicine: " + row.get("medicine_name") + " | Dosage: " + Objects.toString(row.get("dosage"), "Not specified")));
         }
         List<Map<String, Object>> events = jdbc.queryForList("SELECT event_id,event_title,event_date,event_time,reminder_minutes "
-            + "FROM calendar_events WHERE user_id=? AND event_date>=CURDATE() AND event_date<=DATE_ADD(CURDATE(),INTERVAL 30 DAY) "
-            + "AND event_time IS NOT NULL AND reminder_minutes>0", owner);
+            + "FROM calendar_events WHERE user_id=? AND event_date>=CURRENT_DATE AND event_date<=? "
+            + "AND event_time IS NOT NULL AND reminder_minutes>0", owner, Date.valueOf(LocalDate.now().plusDays(30)));
         for (Map<String, Object> row : events) {
             LocalDate date = ((Date) row.get("event_date")).toLocalDate();
             LocalTime time = ((Time) row.get("event_time")).toLocalTime();
@@ -485,11 +511,11 @@ public class WebApiController {
         }
         if (now.getHour() == 9 && now.getMinute() == 0) {
             for (Map<String, Object> row : jdbc.queryForList("SELECT task_id,task_name FROM tasks WHERE user_id=? "
-                + "AND deadline=CURDATE() AND status<>'Completed'", owner)) {
+                + "AND deadline=CURRENT_DATE AND status<>'Completed'", owner)) {
                 due.add(due("tasks", "task:" + row.get("task_id") + ":" + now.toLocalDate(), "Task due today: " + row.get("task_name")));
             }
             for (Map<String, Object> row : jdbc.queryForList("SELECT bill_id,bill_name,amount FROM bills WHERE user_id=? "
-                + "AND due_date=CURDATE() AND payment_status='Unpaid'", owner)) {
+                + "AND due_date=CURRENT_DATE AND payment_status='Unpaid'", owner)) {
                 due.add(due("bills", "bill:" + row.get("bill_id") + ":" + now.toLocalDate(),
                     "Bill due today: " + row.get("bill_name") + " | Amount: ₹" + row.get("amount")));
             }
@@ -524,6 +550,7 @@ public class WebApiController {
     }
 
     @PostMapping("/reminders/action")
+    @Transactional
     public Map<String, Object> reminderAction(@RequestBody Map<String, Object> body) {
         String key = Objects.toString(body.get("key"), "").trim();
         String action = Objects.toString(body.get("action"), "").trim();
@@ -531,10 +558,18 @@ public class WebApiController {
             throw new IllegalArgumentException("Choose a reminder and a valid action.");
         }
         LocalDateTime until = action.equals("SNOOZE") ? LocalDateTime.now().plusMinutes(10) : null;
-        jdbc.update("INSERT INTO reminder_actions(user_id,reminder_key,action_type,snooze_until) VALUES(?,?,?,?) "
-            + "ON DUPLICATE KEY UPDATE action_type=VALUES(action_type),snooze_until=VALUES(snooze_until)",
-            userId(), key, action, until == null ? null : java.sql.Timestamp.valueOf(until));
+        storeReminderAction(userId(), key, action, until == null ? null : java.sql.Timestamp.valueOf(until));
         return Map.of("message", action.equals("SNOOZE") ? "Reminder snoozed for 10 minutes." : "Reminder marked complete.");
+    }
+
+    private void storeReminderAction(int owner, String key, String action, java.sql.Timestamp until) {
+        String sql = "INSERT INTO reminder_actions(user_id,reminder_key,action_type,snooze_until) VALUES(?,?,?,?) "
+            + (postgresqlDatabase
+                ? "ON CONFLICT (user_id,reminder_key) DO UPDATE SET action_type=EXCLUDED.action_type,"
+                    + "snooze_until=EXCLUDED.snooze_until,updated_at=CURRENT_TIMESTAMP"
+                : "ON DUPLICATE KEY UPDATE action_type=VALUES(action_type),snooze_until=VALUES(snooze_until),"
+                    + "updated_at=CURRENT_TIMESTAMP");
+        jdbc.update(sql, owner, key, action, until);
     }
 
     @DeleteMapping("/reminders/action")
