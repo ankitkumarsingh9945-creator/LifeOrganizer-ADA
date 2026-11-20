@@ -79,3 +79,10 @@ The app applies `database/upgrade_all.sql` at startup and stores sign-in session
 - Existing database records are preserved by `upgrade_all.sql`.
 - Currency labels use ₹ for the expense interface; stored values are plain decimal amounts.
 - Charts and reports reflect records saved in the database, including sample records if you add them.
+- ## 🚀 Live Deployment
+
+**Live Website:** https://lifeorganizer-adaproject.vercel.app
+
+**GitHub Repository:** https://github.com/ankitkumarsingh9945-creator/LifeOrganizer-ADA
+
+LifeOrganizer is deployed and accessible online.
